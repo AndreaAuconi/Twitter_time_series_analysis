@@ -1,0 +1,320 @@
+import os
+os.chdir('/home/andrea/Desktop/Twitter_ITA_SciReps/2013/')
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+import powerlaw
+from scipy.optimize import curve_fit
+from joblib import Parallel, delayed
+import multiprocessing
+n_cores = int(multiprocessing.cpu_count()*0.8)
+
+# Political parties
+parties = ['PD', 'SC', 'PdL', 'M5S']
+
+# %%  Import data Elections 2013
+
+directory = '/home/andrea/Desktop/Twitter_ITA_SciReps/2013/Data_13/'
+    
+def import_data (filename):
+    df = pd.read_csv(filename, sep=" ", header=None)
+    df.drop_duplicates()
+    df[1] = pd.to_datetime(df[1])
+    data = sorted(df[1].tolist())
+    return data
+
+filenames = [directory + 'Data_Italy13_' + i + '.txt' for i in parties]
+time_series = Parallel(n_jobs=n_cores)(delayed(import_data)(i) for i in filenames) 
+
+# %% Functions and numerical parameters
+
+# numerical parameters
+sampling_timescale = timedelta(minutes=30) # larger than relaxation timescale to avoid inertia
+further_detrend = False
+delta_t = timedelta(seconds=30)
+initialization = int(timedelta(hours=2)/sampling_timescale)
+end_day, start_day = 1, 7 # night pause
+
+# parameters for fitting and plotting
+list_relaxation = [5, 10, 15, 20, 25, 30]
+tau_0 = sampling_timescale # constraint, please only vary timescales
+tau_max = timedelta(hours=30)
+factor_tau_sampling = 1.2
+
+# Auxiliary variables
+day_hours = [i for i in range(start_day,24)] + [i for i in range(end_day)]
+min_t = min([i[0] for i in time_series])
+max_t = datetime(2013, 2, 23, 0, 0, 0, 0) #pre-election silence
+n = int(1 + np.log(tau_max/tau_0)/np.log(factor_tau_sampling))
+int_tau_list = list(set([int(np.power(factor_tau_sampling,i)) for i in range(0,n)]))
+n_points = len(int_tau_list)
+tau_0_hours = tau_0.seconds/np.power(60,2)
+tau_list = [tau_0_hours*i for i in int_tau_list]
+
+def isDay(hour):
+    return hour in day_hours
+
+def low_pass_filter(events_list,relaxation_timescale):
+    beta = 1./relaxation_timescale.seconds
+    relaxation = np.exp(-delta_t/relaxation_timescale)
+    x_list, t_list = [], []
+    x, t = 0., min_t
+    recording = isDay(min_t.hour)
+    for i in events_list:
+        if i > min_t and i < max_t:
+            if recording and (not isDay(i.hour)):
+                recording = False
+                while t.hour < end_day:
+                    t += delta_t
+                    x = x*relaxation
+                    x_list.append(x)
+                    t_list.append(t)
+            elif isDay(i.hour):
+                if not recording:
+                    recording = True             
+                    t = datetime(i.year, i.month, i.day, start_day, 0, 0, 0)
+                tau = int((i-t)/delta_t)
+                for _ in range(tau):
+                    t += delta_t
+                    x = x*relaxation
+                    x_list.append(x)
+                    t_list.append(t)
+                x += beta
+    while t < max_t:
+        t += delta_t
+        x = x*relaxation
+        x_list.append(x)
+        t_list.append(t)
+    sampling = int(sampling_timescale/delta_t)
+    n = int(len(x_list)/sampling)   
+    x_sample = [x_list[i*sampling] for i in range(initialization,n)]
+    t_sample = [t_list[i*sampling] for i in range(initialization,n)]
+    return x_sample, t_sample
+
+def exp_fun(this_t,a,b):
+    return a*np.exp(b*this_t)
+
+def exp_detrend(series):
+    factor = 1e-4
+    t_disc = [factor*i for i in range(len(series))]
+    [a,b],_ = curve_fit(exp_fun,t_disc,series)
+    new_list = [series[i]/exp_fun(t_disc[i],a,b) for i in range(len(series))]
+    return new_list, a, b
+
+def E_s(T,drift,volatility):
+    return (np.power(volatility,2)/drift)*(1-np.exp(-drift*T))
+
+def GOU_analysis(to_fit): 
+    [series, Poisson] = to_fit
+    dx2_series = []
+    curve = []
+    for int_tau in int_tau_list:
+        this_len = len(series)-int_tau
+        dx2 = np.power(np.log(np.roll(series,-int_tau)/series),2)[:this_len]
+        dx2_series.append(dx2)
+        curve.append(np.mean(dx2)-Poisson)              
+    [drift, volatility],_ = curve_fit(E_s, tau_list, curve, p0 = [0.1,0.1], maxfev = 10000)
+    normalized_fit = [[item*drift for item in tau_list],\
+                      [item/(np.power(volatility,2)/drift) for item in curve]]   
+    normalized_dx2 = []
+    for i in range(n_points):
+        tau = tau_list[i]
+        Z = E_s(tau,drift,volatility)
+        normalized_dx2.append([item/Z for item in dx2_series[i]])    
+    return normalized_fit, normalized_dx2, [drift, volatility]
+
+# %% Analysis
+
+correlation_time = []
+    
+for rel in list_relaxation:
+
+    relaxation_timescale = timedelta(minutes=rel)
+    
+    ## %%  Low-pass filter and normalization      
+    filtered = Parallel(n_jobs=n_cores)(delayed(low_pass_filter)(i,relaxation_timescale) for i in time_series)       
+    x_list_raw, t_list = [i[0] for i in filtered], filtered[0][1]  
+    trend = np.mean(x_list_raw,axis=0)
+    rates = np.mean(x_list_raw,axis=1)    
+    x_list = x_list_raw/(len(parties)*trend) # detrended        
+    if further_detrend:
+        x_list = [exp_detrend(i)[0] for i in x_list]
+    
+    ## %% estimation Poisson noise    
+    Var_rates = np.var(x_list_raw,axis=1)
+    Poisson_Var = (1./(relaxation_timescale.seconds*rates))*(1 + Var_rates/np.power(rates,2))
+    
+    if rel == 20:
+        x_list_plots = x_list
+        Poisson_plots = Poisson_Var
+        
+    ## %%  GOU calibration        
+    data_to_fit = [[x_list[i], Poisson_Var[i]] for i in range(len(parties))]               
+    analysis = Parallel(n_jobs=n_cores)(delayed(GOU_analysis)(this) for this in data_to_fit)      
+    for i in range(len(parties)):
+        print(parties[i])
+        print(analysis[i][2])
+    
+    ## %% Plot normalized GOU fit    
+    tau_list_refined = [tau_0_hours*np.power(2,i/100) for i in range(-500,700)]
+    log_normal_scaling = [E_s(t,1.,1.) for t in tau_list_refined]
+    GBM_scaling = [t for t in tau_list_refined]   
+    plt.clf()
+    for this in analysis: 
+        plt.scatter(this[0][0],this[0][1],s=50)
+    plt.plot(tau_list_refined, log_normal_scaling, linewidth = 1.5, linestyle = 'dashed', color = 'black')
+    plt.plot(tau_list_refined, GBM_scaling, linewidth = 1.5, linestyle = 'dashed', color = 'gray')
+    names = parties + ['GOU fit', 'GBM']
+    plt.legend(names)
+    plt.ylim(0.,1.15)
+    plt.xlim(0.,7.5)
+    plt.ylabel(r'$\mathbb{E} z(\tau)$      ', rotation = 0, fontsize=15)
+    plt.xlabel(r'$\tau$', fontsize=14)
+    filename = 'Normalized_fit_' + str(relaxation_timescale.seconds/60.)[:5] + '.pdf'
+    plt.tight_layout()
+    plt.savefig(filename, bbox_inches='tight')
+        
+    ## %% Plot distributions p(z) for each time interval    
+    if rel == 20:
+        n_replicas = 1e7
+        log_normal_process = []
+        for i in range(int(n_replicas)):
+            log_normal_process.append(np.power(np.random.normal(0,1),2))               
+        for i in range(n_points):
+            tau = tau_list[i]
+            plt.clf()
+            for j in range(len(parties)): 
+                powerlaw.plot_pdf(analysis[j][1][i])
+            names = parties + ['GOU fit']
+            powerlaw.plot_pdf(log_normal_process, linewidth = 1.5, linestyle = 'dashed', color = 'black')
+            plt.legend(names)
+            plt.xlim(2e-5, 70)
+            plt.ylim(8e-6, 1.5e3)
+            plt.ylabel(r'$p(\widetilde{z})$', rotation = 0, fontsize=14)
+            plt.xlabel(r'$\widetilde{z}$', fontsize=14)
+            filename = 'p_z/Distribution_tau_' + str(tau)[:6] + '.pdf'
+            plt.tight_layout()
+            plt.savefig(filename, bbox_inches='tight')
+    
+    ## %% Estimated timescale 
+    corr_time = np.sum([rates[i]*(1/analysis[i][2][0])/np.sum(rates) for i in range(len(parties))])
+    correlation_time.append(corr_time)
+
+plt.clf()
+plt.scatter(list_relaxation,correlation_time)
+plt.xlabel(r'$\beta^{-1}$ [min]', size = 14)
+plt.ylabel(r'$\alpha^{-1}$ [hours]', size = 14)
+plt.ylim(0,5)
+plt.savefig('timescale_estimation.pdf')
+
+# %% Extreme events
+
+plt.clf()
+fig, axs = plt.subplots(2, 2, sharey = True)
+axs[0, 0].tick_params(axis='both', which='major', labelsize=7)
+axs[0, 1].tick_params(axis='both', which='major', labelsize=7)
+axs[1, 0].tick_params(axis='both', which='major', labelsize=7)
+axs[1, 1].tick_params(axis='both', which='major', labelsize=7)
+plt.ylim(0.,1.5)
+
+series = x_list_plots[2]
+dx2_series = [np.power(np.log(series[i+1]/series[i]),2) for i in range(len(series)-1)]
+begin_t = 1500
+end_t = 1600
+axs[0, 0].scatter(t_list[begin_t+1:end_t],dx2_series[begin_t:end_t-1], s=2)
+axs[0, 0].plot(t_list[begin_t+1:end_t],series[begin_t+1:end_t], linewidth=0.3, color = 'orange')
+axs[0, 0].tick_params(labelrotation=30)
+axs[0, 0].set_title('Sanremo music festival interrupted by \n pro-Berlusconi protesters', size = 8)
+axs[0, 0].legend([r'$s(t,\tau)$',r'$x(t)$'], prop={'size': 6})
+
+series = x_list_plots[0]
+dx2_series = [np.power(np.log(series[i+1]/series[i]),2) for i in range(len(series)-1)]
+begin_t = 200
+end_t = 300
+axs[0, 1].scatter(t_list[begin_t+1:end_t],dx2_series[begin_t:end_t-1], s=2)
+axs[0, 1].plot(t_list[begin_t+1:end_t],series[begin_t+1:end_t], linewidth=0.3, color = 'orange')
+axs[0, 1].tick_params(labelrotation=30)
+axs[0, 1].set_title('Democratic candidate hosted\n in popular tv program', size = 8)
+axs[0, 1].legend([r'$s(t,\tau)$',r'$x(t)$'], prop={'size': 6})
+
+series = x_list_plots[3]
+dx2_series = [np.power(np.log(series[i+1]/series[i]),2) for i in range(len(series)-1)]
+begin_t = 1300
+end_t = 1400
+axs[1, 0].scatter(t_list[begin_t+1:end_t],dx2_series[begin_t:end_t-1], s=2)
+axs[1, 0].plot(t_list[begin_t+1:end_t],series[begin_t+1:end_t], linewidth=0.3, color = 'orange')
+axs[1, 0].tick_params(labelrotation=30)
+axs[1, 0].set_title('Low volume in M5S Movement tweets \n creates noise in the log-variation', size = 8)
+axs[1, 0].legend([r'$s(t,\tau)$',r'$x(t)$'], prop={'size': 6})
+
+series = x_list_plots[1]
+dx2_series = [np.power(np.log(series[i+1]/series[i]),2) for i in range(len(series)-1)]
+begin_t = 1570
+end_t = 1670
+axs[1, 1].scatter(t_list[begin_t+1:end_t],dx2_series[begin_t:end_t-1], s=2)
+axs[1, 1].plot(t_list[begin_t+1:end_t],series[begin_t+1:end_t], linewidth=0.3, color = 'orange')
+axs[1, 1].tick_params(labelrotation=30)
+axs[1, 1].set_title('Current prime minister Mario Monti reveals \n hidden political negotiations.', size = 8)
+axs[1, 1].legend([r'$s(t,\tau)$',r'$x(t)$'], prop={'size': 6})
+
+fig.tight_layout()
+plt.savefig('Extreme_events_2013.pdf')
+
+# %% Prediction exercise
+
+plot_list = [datetime(2013, 2, 22, 8, 0, 0),
+             datetime(2013, 2, 22, 12, 0, 0),
+             datetime(2013, 2, 22, 16, 0, 0),
+             datetime(2013, 2, 22, 20, 0, 0)]
+
+for last_day_t in plot_list:
+    
+    reduced_params = []   
+    t_list_reduced = [t for t in t_list if t<last_day_t]
+    reduced_n = len(t_list_reduced)
+    
+    for this in range(len(parties)):        
+        reduced_series = x_list_plots[this][:reduced_n+1]
+        _,_,[drift, volatility] = GOU_analysis([reduced_series,Poisson_plots[this]])
+        mean_x_tilde = np.mean(np.log(reduced_series)[-int_tau_list[-1]:])
+        last_value = np.log(reduced_series)[-1]
+        reduced_params.append([drift,volatility,mean_x_tilde,last_value])
+                
+    def mean_plot(t_series, params):
+        tau_series = [(t-last_day_t).seconds/np.power(60,2) for t in t_series]
+        return [params[2] + (params[3]-params[2])*np.exp(-params[0]*tau) for tau in tau_series]
+    def sqrt_plot(t_series, params):
+        mu = mean_plot(t_series, params)
+        tau_series = [(t-last_day_t).seconds/np.power(60,2) for t in t_series]
+        Var = [(np.power(params[1],2)/(2*params[0]))*(1-np.exp(-2*params[0]*tau)) for tau in tau_series]
+        return [mu[i] + 2*np.sqrt(Var[i]) for i in range(len(mu))], [mu[i] - 2*np.sqrt(Var[i]) for i in range(len(mu))]
+    
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    this_linewidth = 0.5
+    refined_list_t = []
+    n_disc = 100
+    for i in range(reduced_n,len(t_list)-1):
+        t = t_list[i]
+        t2 = t_list[i+1]
+        for j in range(n_disc):
+            tj = t + j*(t2-t)/n_disc
+            refined_list_t.append(tj)
+     
+    plt.clf()
+    fig, ax = plt.subplots()
+    for i in range(len(parties)):
+        plt.plot(refined_list_t,mean_plot(refined_list_t,reduced_params[i]),linewidth=this_linewidth*2, color = colors[i])
+        plt.plot(refined_list_t,sqrt_plot(refined_list_t,reduced_params[i])[0],linewidth=this_linewidth, color = colors[i])
+        plt.plot(refined_list_t,sqrt_plot(refined_list_t,reduced_params[i])[1],linewidth=this_linewidth, color = colors[i])
+        plt.scatter(t_list,np.log(x_list_plots[i]), s = 15, color = colors[i])
+            
+    plt.tick_params(rotation = 45)
+    plt.ylabel('$\widetilde{x}$', rotation = 0, size = 14)
+    plt.xlim(last_day_t,last_day_t+timedelta(hours=3.1))
+    plt.ylim(-2.5,-0.5)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.title(str(last_day_t)[11:16])
+    filename = str(last_day_t)[11:16] + '.pdf'
+    plt.savefig(filename)
